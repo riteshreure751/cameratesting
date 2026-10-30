@@ -1,21 +1,4 @@
 ```python
-from gpiozero import AngularServo
-from time import sleep
-
-# Initialize servo on GPIO 18
-servo = AngularServo(18, min_angle=0, max_angle=180)
-
-print("Servo Motor Started")
-
-# Complete 2 cycles
-for cycle in range(2):
-
-    print("Cycle:", cycle + 1)
-
-    # Rotate 0 to 180 degrees
-    for angle in range(0, 181, 5):
-        servo.angle = angle
-        sleep(0.05)```python
 from gpiozero import Servo
 from time import sleep
 
@@ -47,18 +30,4 @@ for cycle in range(2):
 print("Movement completed")
 
 servo.detach()
-```
-
-
-    # Rotate 180 to 0 degrees
-    for angle in range(180, -1, -5):
-        servo.angle = angle
-        sleep(0.05)
-
-print("2 Cycles Completed")
-
-# Stop servo
-servo.detach()
-
-print("Servo Motor Stopped")
 ```
