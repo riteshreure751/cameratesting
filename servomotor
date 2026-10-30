@@ -1,0 +1,47 @@
+```python
+from gpiozero import AngularServo
+from time import sleep
+
+# Initialize Servo Motors
+servo1 = AngularServo(18, min_angle=0, max_angle=180)
+servo2 = AngularServo(19, min_angle=0, max_angle=180)
+
+print("Servo Motor 1 Started")
+
+# First Servo: Complete 2 cycles (0 to 180 and back to 0)
+for cycle in range(2):
+
+    print("Servo 1 - Cycle:", cycle + 1)
+
+    # Rotate from 0 to 180 degrees
+    for angle in range(0, 181, 5):
+        servo1.angle = angle
+        sleep(0.05)
+
+    # Rotate from 180 to 0 degrees
+    for angle in range(180, -1, -5):
+        servo1.angle = angle
+        sleep(0.05)
+
+print("Servo Motor 1 Completed 2 Cycles")
+
+# Second Servo starts after first servo completes
+print("Servo Motor 2 Started")
+
+# Second Servo: Sweep from 40 to 110 degrees and back
+for angle in range(40, 111, 5):
+    servo2.angle = angle
+    sleep(0.05)
+
+for angle in range(110, 39, -5):
+    servo2.angle = angle
+    sleep(0.05)
+
+print("Servo Motor 2 Completed")
+
+# Stop servo signals
+servo1.detach()
+servo2.detach()
+
+print("Both Servo Motors Completed Successfully")
+```
