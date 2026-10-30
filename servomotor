@@ -15,7 +15,40 @@ for cycle in range(2):
     # Rotate 0 to 180 degrees
     for angle in range(0, 181, 5):
         servo.angle = angle
-        sleep(0.05)
+        sleep(0.05)```python
+from gpiozero import Servo
+from time import sleep
+
+# Initialize servo
+servo = Servo(
+    18,
+    min_pulse_width=0.0005,
+    max_pulse_width=0.0025
+)
+
+def smooth_move(start, end, steps=200):
+    for i in range(steps + 1):
+        value = start + (end - start) * i / steps
+        servo.value = value
+        sleep(0.02)
+
+print("Servo started")
+
+for cycle in range(2):
+
+    print("Cycle:", cycle + 1)
+
+    # 0 degree to 180 degree
+    smooth_move(-1, 1)
+
+    # 180 degree to 0 degree
+    smooth_move(1, -1)
+
+print("Movement completed")
+
+servo.detach()
+```
+
 
     # Rotate 180 to 0 degrees
     for angle in range(180, -1, -5):
