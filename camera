@@ -1,0 +1,39 @@
+```python
+from picamera2 import Picamera2
+from datetime import datetime
+import os
+import time
+
+# Initialize camera
+camera = Picamera2()
+camera.start()
+
+# Folder to save images
+folder = "/home/pi/captured_images"
+
+# Create folder if it doesn't exist
+os.makedirs(folder, exist_ok=True)
+
+print("Camera is ready!")
+
+try:
+    while True:
+        input("Press ENTER to capture an image...")
+
+        # Generate unique filename using date and time
+        filename = datetime.now().strftime("image_%Y%m%d_%H%M%S_%f.jpg")
+
+        # Complete image path
+        image_path = os.path.join(folder, filename)
+
+        # Capture and save image
+        camera.capture_file(image_path)
+
+        print("Image saved successfully:", image_path)
+
+except KeyboardInterrupt:
+    print("\nCamera stopped.")
+
+finally:
+    camera.stop()
+```
