@@ -11,14 +11,12 @@ INSTALL:  sudo apt update
           sudo raspi-config -> Interface Options -> Serial Port -> login shell: NO, serial hardware: YES -> reboot
 
 WIRING (physical pin numbers of the 40-pin header)
-  TF-Luna (UART)   +5V red   -> Pin 2 (5V)        GND black -> Pin 6 (GND)
-                   TXD green -> Pin 10 (GPIO15 RXD)   RXD white -> Pin 8 (GPIO14 TXD)   (config pin: leave open)
-  HC-SR04          VCC -> Pin 4 (5V)   GND -> Pin 9 (GND)   TRIG -> Pin 16 (GPIO23)
-                   ECHO -> 1k ohm -> Pin 18 (GPIO24) -> 2k ohm -> GND   (voltage divider, ECHO is 5 V!)
-  L298N            ENA -> Pin 12 (GPIO18)   IN1 -> Pin 11 (GPIO17)   IN2 -> Pin 13 (GPIO27)
-                   GND -> Pin 14 (GND) AND battery minus   +12V terminal -> motor battery plus
-                   OUT1/OUT2 -> DC geared motor      (remove the ENA jumper; do not feed L298N 5V into the Pi)
-  Pi Camera        ribbon cable -> CSI camera port
+  HC-SR04   VCC -> Pin 2 (5V)   GND -> Pin 6   TRIG -> Pin 16 (GPIO23)
+            ECHO -> voltage divider (1k + 2k) -> Pin 18 (GPIO24)
+  TF-Luna   VCC -> Pin 4 (5V)   GND -> Pin 14   TX -> Pin 10 (GPIO15 RXD)   RX -> Pin 8 (GPIO14 TXD)
+  L298N     ENA + ENB (both) -> Pin 12 (GPIO18)   IN1 -> Pin 29 (GPIO5)   IN3 -> Pin 31 (GPIO6)
+            IN2 and IN4 -> GND (important, do not leave them floating)   GND -> Pin 20 + battery minus
+  Pi Camera ribbon cable -> CSI camera port
 
 Everything (folders, web page, sensors, camera, train control, editor, terminal) is created by this file.
 """
@@ -36,7 +34,7 @@ try:
 except ImportError:
     serial = None
 try:
-    from gpiozero import DistanceSensor, DigitalOutputDevice, PWMOutputDevice
+    from gpiozero import OutputDevice, InputDevice, DigitalOutputDevice, PWMOutputDevice
     GPIO_OK = True
 except Exception:
     GPIO_OK = False
@@ -59,7 +57,9 @@ LIDAR_OFFSET_CM = 0.0       # distance from LiDAR to front of engine (TF-Luna bl
 US_TRIG, US_ECHO = 23, 24   # BCM numbers
 US_OFFSET_CM = 0.0
 
-MOTOR_ENA, MOTOR_IN1, MOTOR_IN2 = 18, 17, 27   # BCM numbers (forward only)
+MOTOR_PWM_PIN = 18          # ENA + ENB tied together (BCM) -> speed
+MOTOR_FWD_PINS = [5, 6]     # IN1, IN3 (BCM) -> HIGH = forward
+MOTOR_LOW_PINS = []         # IN2, IN4: wire them to GND (or list their GPIO numbers here)
 DEFAULT_SPEED = 150         # 0-255 constant speed
 START_PWM = 40              # first PWM value at start (very slow)
 RAMP_SECONDS = 6.0          # time to go from slow start to constant speed
@@ -134,8 +134,11 @@ def _auth():
 
 
 # ------------------------------ sensors -------------------------------------
+ON_PI = os.path.exists("/proc/device-tree/model")
 LD = {"cm": None, "strength": 0, "temp": None, "t": 0.0}
 US = {"cm": None, "t": 0.0}
+LDIAG = {"msg": "starting...", "port": None, "baud": None, "bytes": 0, "frames": 0}
+UDIAG = {"msg": "starting...", "ok": 0, "fail": 0}
 SIM_L = SIM_U = False
 
 
@@ -143,39 +146,123 @@ def sval(d, maxage=0.6):
     return d["cm"] if (d["cm"] is not None and time.time() - d["t"] < maxage) else None
 
 
-def lidar_thread(ser):
-    buf = bytearray()
+def parse_frames(buf):
+    """Pull valid 9-byte TF-Luna frames out of buf (a bytearray, edited in place)."""
+    out = []
+    while len(buf) >= 9:
+        if buf[0] == 0x59 and buf[1] == 0x59 and (sum(buf[:8]) & 0xFF) == buf[8]:
+            out.append((buf[2] | (buf[3] << 8), buf[4] | (buf[5] << 8), (buf[6] | (buf[7] << 8)) / 8.0 - 256))
+            del buf[:9]
+        else:
+            del buf[0]
+    return out
+
+
+def open_lidar():
+    """Try the usual serial ports and baud rates until real TF-Luna frames show up."""
+    ports = []
+    for p in (LIDAR_PORT, "/dev/serial0", "/dev/ttyAMA0", "/dev/ttyS0"):
+        if os.path.exists(p) and os.path.realpath(p) not in [os.path.realpath(x) for x in ports]:
+            ports.append(p)
+    if not ports:
+        LDIAG["msg"] = "No serial port. Run sudo raspi-config > Interface Options > Serial Port (login shell: No, hardware: Yes) and reboot"
+        return None
+    most, err = 0, None
+    for port in ports:
+        for baud in dict.fromkeys([LIDAR_BAUD, 115200, 9600, 57600, 38400, 19200]):
+            LDIAG["msg"] = "Scanning %s @ %d baud..." % (port, baud)
+            try:
+                ser = serial.Serial(port, baud, timeout=0.1)
+            except Exception as e:
+                err = "Cannot open %s: %s" % (port, e)
+                break
+            ser.reset_input_buffer()
+            buf, n, t0 = bytearray(), 0, time.time()
+            while time.time() - t0 < 0.6:
+                d = ser.read(64)
+                n += len(d)
+                buf += d
+            if parse_frames(buf):
+                LDIAG.update(port=port, baud=baud, msg="TF-Luna found")
+                return ser
+            ser.close()
+            most = max(most, n)
+    if most == 0:
+        LDIAG["msg"] = err or "Serial opens but 0 bytes received: check TF-Luna TX -> Pin 10, RX -> Pin 8, 5V power, and that serial login shell is disabled"
+    else:
+        LDIAG["msg"] = "Bytes received but no TF-Luna frames: wrong baud rate or serial console still enabled"
+    return None
+
+
+def lidar_thread():
     while True:
-        try:
-            buf += ser.read(max(ser.in_waiting, 9))
-        except Exception:
-            time.sleep(0.2)
+        ser = open_lidar()
+        if ser is None:
+            time.sleep(2)
             continue
-        while len(buf) >= 9:
-            if buf[0] == 0x59 and buf[1] == 0x59 and (sum(buf[:8]) & 0xFF) == buf[8]:
-                dist = buf[2] | (buf[3] << 8)
-                st = buf[4] | (buf[5] << 8)
-                tmp = (buf[6] | (buf[7] << 8)) / 8.0 - 256
-                if dist > 0 and 100 <= st < 65535:
-                    LD.update(cm=round(dist - LIDAR_OFFSET_CM, 1), strength=st, temp=round(tmp, 1), t=time.time())
+        buf, last_ok = bytearray(), time.time()
+        while time.time() - last_ok < 4:
+            try:
+                d = ser.read(max(ser.in_waiting, 9))
+            except Exception as e:
+                LDIAG["msg"] = "Serial error: %s" % e
+                break
+            LDIAG["bytes"] += len(d)
+            buf += d
+            for dist, st, tmp in parse_frames(buf):
+                last_ok = time.time()
+                LDIAG["frames"] += 1
+                if st == 65535:
+                    LD["cm"], LDIAG["msg"] = None, "Signal saturated (target too close or too bright)"
+                elif dist <= 0 or st < 30:
+                    LD["cm"], LDIAG["msg"] = None, "No valid target (under 20 cm blind zone, nothing in range, or weak signal)"
                 else:
-                    LD["cm"] = None
-                del buf[:9]
-            else:
-                del buf[0]
+                    LD.update(cm=round(dist - LIDAR_OFFSET_CM, 1), strength=st, temp=round(tmp, 1), t=time.time())
+                    LDIAG["msg"] = "OK"
+        try:
+            ser.close()
+        except Exception:
+            pass
+        LDIAG["msg"] = "Lost LiDAR data - rescanning..."
+        LD["cm"] = None
 
 
-def ultra_thread(sensor):
+def us_measure(trig, echo):
+    """One HC-SR04 reading. Returns (cm or None, reason)."""
+    trig.on()
+    time.sleep(0.00002)
+    trig.off()
+    t0 = time.perf_counter()
+    while not echo.value:
+        if time.perf_counter() - t0 > 0.03:
+            return None, "ECHO never went high: check TRIG/ECHO wires and 5V power"
+    ts = time.perf_counter()
+    while echo.value:
+        if time.perf_counter() - ts > 0.03:
+            return None, "ECHO stuck high: check the voltage divider / ECHO wire"
+    return (time.perf_counter() - ts) * 34300.0 / 2.0, ""
+
+
+def ultra_thread(trig, echo):
+    recent, fails = collections.deque(maxlen=3), 0
     while True:
         try:
-            d = sensor.distance * 100.0
-            if d < 199:
-                US.update(cm=round(d - US_OFFSET_CM, 1), t=time.time())
-            else:
+            d, why = us_measure(trig, echo)
+        except Exception as e:
+            d, why = None, "GPIO error: %s" % e
+        if d is not None and 2 <= d <= 400:
+            recent.append(d)
+            fails = 0
+            UDIAG["ok"] += 1
+            UDIAG["msg"] = "OK"
+            US.update(cm=round(float(np.median(recent)) - US_OFFSET_CM, 1), t=time.time())
+        else:
+            fails += 1
+            UDIAG["fail"] += 1
+            if fails >= 4:
                 US["cm"] = None
-        except Exception:
-            US["cm"] = None
-        time.sleep(0.05)
+                UDIAG["msg"] = why or "Out of range (under 2 cm or over 4 m)"
+        time.sleep(0.065)
 
 
 def sim_thread():
@@ -191,29 +278,40 @@ def sim_thread():
 
 def start_sensors():
     global SIM_L, SIM_U
-    ser = None
+    if not ON_PI:
+        SIM_L = SIM_U = True
+        LDIAG["msg"] = UDIAG["msg"] = "simulated (not running on a Raspberry Pi)"
+        print("[SIMULATION] not on a Raspberry Pi - sensors are simulated")
+        threading.Thread(target=sim_thread, daemon=True).start()
+        return
     if serial:
-        try:
-            ser = serial.Serial(LIDAR_PORT, LIDAR_BAUD, timeout=0.05)
-        except Exception as e:
-            print("[LiDAR] cannot open %s: %s" % (LIDAR_PORT, e))
-    if ser:
-        threading.Thread(target=lidar_thread, args=(ser,), daemon=True).start()
+        threading.Thread(target=lidar_thread, daemon=True).start()
     else:
-        SIM_L = True
-    us = None
+        LDIAG["msg"] = "pyserial missing: sudo apt install python3-serial"
     if GPIO_OK:
         try:
-            us = DistanceSensor(echo=US_ECHO, trigger=US_TRIG, max_distance=2.0, queue_len=3)
+            trig, echo = OutputDevice(US_TRIG, initial_value=False), InputDevice(US_ECHO, pull_up=False)
+            threading.Thread(target=ultra_thread, args=(trig, echo), daemon=True).start()
         except Exception as e:
-            print("[Ultrasonic] cannot start: %s" % e)
-    if us:
-        threading.Thread(target=ultra_thread, args=(us,), daemon=True).start()
+            UDIAG["msg"] = "GPIO error: %s" % e
     else:
-        SIM_U = True
-    if SIM_L or SIM_U:
-        print("[SIMULATION] some sensors are simulated (hardware not found)")
-        threading.Thread(target=sim_thread, daemon=True).start()
+        UDIAG["msg"] = "gpiozero missing: sudo apt install python3-gpiozero python3-lgpio"
+
+
+def lidar_note():
+    if SIM_L:
+        return "simulated"
+    if sval(LD) is not None:
+        return "%s @ %s baud - signal %d%s" % (LDIAG["port"], LDIAG["baud"], LD["strength"], " (weak)" if LD["strength"] < 100 else "")
+    return LDIAG["msg"]
+
+
+def ultra_note():
+    if SIM_U:
+        return "simulated"
+    if sval(US) is not None:
+        return "TRIG GPIO%d / ECHO GPIO%d - OK" % (US_TRIG, US_ECHO)
+    return UDIAG["msg"]
 
 
 # ------------------------------ camera --------------------------------------
@@ -275,7 +373,8 @@ CLASSES = ["background", "aeroplane", "bicycle", "bird", "boat", "bottle", "bus"
 class Detector:
     """Camera confirmation. Uses MobileNet-SSD if its files are in models/, else a frame-change fallback."""
     def __init__(self):
-        self.net, self.hist = None, collections.deque(maxlen=8)
+        self.net, self.hist, self.baseline = None, collections.deque(maxlen=8), None
+        self.bpath = os.path.join(ROOT, "models", "clear_reference.jpg")
         pt = os.path.join(ROOT, "models", "MobileNetSSD_deploy.prototxt")
         cm = os.path.join(ROOT, "models", "MobileNetSSD_deploy.caffemodel")
         if os.path.exists(pt) and os.path.exists(cm):
@@ -284,6 +383,9 @@ class Detector:
                 print("[Detector] MobileNet-SSD loaded")
             except Exception as e:
                 print("[Detector] model load failed: %s" % e)
+        img = cv2.imread(self.bpath) if os.path.exists(self.bpath) else None
+        if img is not None:
+            self.baseline = self.small(img)
 
     @staticmethod
     def small(f):
@@ -292,7 +394,12 @@ class Detector:
     def note_clear(self, f):
         self.hist.append((time.time(), self.small(f)))
 
-    def check(self, f):
+    def set_baseline(self, f):
+        cv2.imwrite(self.bpath, f)
+        self.baseline = self.small(f)
+
+    def check(self, f, use_baseline=False):
+        """Returns (True/False/None, label). None = camera cannot judge (no model, no reference)."""
         if self.net is not None:
             blob = cv2.dnn.blobFromImage(cv2.resize(f, (300, 300)), 0.007843, (300, 300), 127.5)
             self.net.setInput(blob)
@@ -302,12 +409,16 @@ class Detector:
                 x1, y1, x2, y2 = det[0, 0, i, 3:7]
                 if conf > 0.4 and 0 < idx < len(CLASSES) and 0.15 < (x1 + x2) / 2 < 0.85 and y2 > 0.4:
                     return True, CLASSES[idx]
-        now, ref = time.time(), None
-        for t, s in self.hist:
-            if now - t >= 0.8:
-                ref = s
+        ref = None
+        if use_baseline and self.baseline is not None:
+            ref = self.baseline
+        else:
+            now = time.time()
+            for t, sm in self.hist:
+                if now - t >= 0.8:
+                    ref = sm
         if ref is None:
-            return False, None
+            return (False if self.net is not None else None), None
         diff = float(np.mean(cv2.absdiff(self.small(f), ref)[12:60, 16:64]))
         return diff > DIFF_THRESH, "Object / obstacle"
 
@@ -381,11 +492,12 @@ class Train:
     def __init__(self):
         self.running, self.braked, self.reason = False, False, ""
         self.target, self.cur, self.t_start = DEFAULT_SPEED, 0, 0.0
-        self.in1 = self.in2 = self.pwm = None
-        if GPIO_OK:
+        self.fwd, self.low, self.pwm = [], [], None
+        if GPIO_OK and ON_PI:
             try:
-                self.in1, self.in2 = DigitalOutputDevice(MOTOR_IN1), DigitalOutputDevice(MOTOR_IN2)
-                self.pwm = PWMOutputDevice(MOTOR_ENA, frequency=1000)
+                self.fwd = [DigitalOutputDevice(p) for p in MOTOR_FWD_PINS]
+                self.low = [DigitalOutputDevice(p) for p in MOTOR_LOW_PINS]
+                self.pwm = PWMOutputDevice(MOTOR_PWM_PIN, frequency=1000)
             except Exception as e:
                 print("[Motor] cannot start: %s (motor simulated)" % e)
         threading.Thread(target=self.loop, daemon=True).start()
@@ -393,10 +505,16 @@ class Train:
     def _apply(self, v):
         if not self.pwm:
             return
+        for d in self.low:
+            d.off()
         if v <= 0:
-            self.in1.off(); self.in2.off(); self.pwm.value = 0
+            for d in self.fwd:
+                d.off()
+            self.pwm.value = 0
         else:
-            self.in1.on(); self.in2.off(); self.pwm.value = min(1.0, v / 255.0)
+            for d in self.fwd:
+                d.on()
+            self.pwm.value = min(1.0, v / 255.0)
 
     def start(self):
         if OBS["state"] != "clear":
@@ -495,8 +613,8 @@ def snapshot():
     dist = OBS["distance"] if OBS["state"] != "clear" else near
     return {
         "t": now, "sim": SIM_L or SIM_U,
-        "lidar": {"cm": sval(LD), "ok": sval(LD) is not None, "strength": LD["strength"], "sim": SIM_L},
-        "ultra": {"cm": sval(US), "ok": sval(US) is not None, "sim": SIM_U},
+        "lidar": {"cm": sval(LD), "ok": sval(LD) is not None, "strength": LD["strength"], "sim": SIM_L, "note": lidar_note()},
+        "ultra": {"cm": sval(US), "ok": sval(US) is not None, "sim": SIM_U, "note": ultra_note()},
         "obstacle": {"state": OBS["state"], "label": OBS["label"], "distance": dist, "snap_id": OBS["snap_id"]},
         "train": {"running": train.running, "ramping": train.ramping(), "cur": train.cur, "target": train.target,
                   "braked": train.braked, "reason": train.reason},
@@ -706,6 +824,74 @@ def api_term_input():
     return jsonify(ok=True)
 
 
+CHECK = {"snap": None, "id": 0, "hist": collections.deque(maxlen=8)}
+
+
+@app.route("/api/check", methods=["GET", "POST"])
+def api_check():
+    """One-shot obstacle check: reads both sensors for ~1 s, then asks the camera."""
+    if request.method == "GET":
+        return jsonify(list(CHECK["hist"]))
+    l, u = [], []
+    for _ in range(12):
+        a, b = sval(LD), sval(US)
+        if a is not None:
+            l.append(a)
+        if b is not None:
+            u.append(b)
+        time.sleep(0.08)
+    med = lambda x: round(float(np.median(x)), 1) if x else None
+    lc, uc = med(l), med(u)
+    vals = [v for v in (lc, uc) if v is not None]
+    near = min(vals) if vals else None
+    fr = camera.get_frame()
+    cam_ok, label = (None, None)
+    if fr is not None:
+        cam_ok, label = detector.check(fr, use_baseline=True)
+    cam_txt = {True: "object seen", False: "nothing seen", None: "no reference yet"}[cam_ok]
+    hit = near is not None and near <= OBSTACLE_CM
+    if hit and cam_ok:
+        level, verdict = "danger", "OBSTACLE PRESENT - camera confirmed"
+    elif hit:
+        level, verdict = "danger", "OBSTACLE PRESENT - sensors only (camera %s)" % ("did not confirm" if cam_ok is False else "cannot judge yet")
+    elif cam_ok:
+        level, verdict = "warn", "CAMERA SEES AN OBJECT - sensors read %s" % ("%.1f cm (beyond %g cm)" % (near, OBSTACLE_CM) if near is not None else "no data")
+    elif near is None:
+        level, verdict = "error", "NO SENSOR DATA - cannot check the track"
+    else:
+        level, verdict = "ok", "TRACK CLEAR - nearest object %.1f cm" % near
+    if fr is not None:
+        img = cv2.resize(fr, (480, int(480 * fr.shape[0] / fr.shape[1])))
+        cv2.putText(img, verdict[:34], (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    {"danger": (60, 60, 255), "warn": (0, 176, 255), "ok": (120, 230, 90)}.get(level, (200, 200, 200)), 2)
+        CHECK["snap"], CHECK["id"] = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes(), CHECK["id"] + 1
+    res = {"time": datetime.datetime.now().strftime("%H:%M:%S"), "level": level, "verdict": verdict, "lidar": lc, "ultra": uc,
+           "nearest": near, "camera": cam_txt, "label": label if cam_ok else None, "snap_id": CHECK["id"]}
+    CHECK["hist"].append(res)
+    try:
+        with open(os.path.join(ROOT, "logs", "obstacle_checks.log"), "a") as fh:
+            fh.write(datetime.datetime.now().isoformat(timespec="seconds") + " " + json.dumps(res) + "\n")
+    except Exception:
+        pass
+    return jsonify(res)
+
+
+@app.route("/check.jpg")
+def check_jpg():
+    if not CHECK["snap"]:
+        abort(404)
+    return Response(CHECK["snap"], mimetype="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@app.route("/api/baseline", methods=["POST"])
+def api_baseline():
+    fr = camera.get_frame()
+    if fr is None:
+        return jsonify(ok=False, error="Camera not ready"), 503
+    detector.set_baseline(fr)
+    return jsonify(ok=True)
+
+
 @app.route("/api/shutdown", methods=["POST"])
 def api_shutdown():
     train.stop("Shutdown")
@@ -791,6 +977,18 @@ input[type=range]{width:100%;height:8px;margin:18px 0 10px;accent-color:var(--bl
 .tbtn.ramp{background:#7a5a10;border-color:var(--amber)}
 .tbtn.brk{background:#7a1c22;border-color:#ff5a5a}
 .tmsg{min-height:20px;margin-top:8px;font-size:14px;color:var(--mut)}
+.snote{font-size:13px;color:#a9bbd9;text-align:center;padding:0 8px 2px;min-height:18px}
+.chk{display:flex;gap:18px;align-items:stretch;flex-wrap:wrap}
+.chkL{display:flex;flex-direction:column;gap:10px;min-width:250px;max-width:300px}
+.chkL .btn{justify-content:center}.btn.big{font-size:20px;padding:16px 22px}
+.chkR{flex:1;min-width:320px;border:1px solid var(--line);border-radius:8px;padding:12px 16px;background:#0a1324}
+.chkR.ok{background:#0c2418;border-color:#1c6b43}.chkR.warn{background:#2a2108;border-color:#a67a14}
+.chkR.danger{background:#2a0c12;border-color:#c3262d}.chkR.error{background:#1d1d26;border-color:#6b6b80}
+.chkV{font-size:23px;font-weight:700}
+.chkR.ok .chkV{color:var(--green)}.chkR.warn .chkV{color:var(--amber)}.chkR.danger .chkV{color:#ff5d4f}
+.chkG{display:flex;gap:30px;flex-wrap:wrap;margin-top:12px;font-size:16px;color:#c9d6f2}
+.chkG b{display:block;font-size:26px;color:#fff;margin-top:2px}
+.chkH{font-size:13px;color:#b9c8e6;line-height:1.6;max-height:130px;overflow:auto}
 #tree{max-height:222px;overflow:auto;font-size:17px;margin-top:6px}
 #tree ul{list-style:none;margin:0;padding-left:20px}#tree>ul{padding-left:0}
 .trow{display:flex;align-items:center;gap:7px;padding:4px 4px;border-radius:4px;cursor:pointer;white-space:nowrap}
@@ -842,6 +1040,7 @@ input[type=range]{width:100%;height:8px;margin:18px 0 10px;accent-color:var(--bl
  <a data-go="secCam"><svg width="26" height="26" viewBox="0 0 24 24" fill="#dbe5fb"><path d="M9 4 7.5 6H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-3.5L15 4zm3 4.5a4.5 4.5 0 1 1 0 9 4.5 4.5 0 0 1 0-9z"/></svg><span>Camera &amp; Dataset</span></a>
  <a data-go="secFiles"><svg width="26" height="26" viewBox="0 0 24 24" fill="#9fc3ff"><path d="M2 5a2 2 0 0 1 2-2h5l2 2h9a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2z"/></svg><span>Project Files</span></a>
  <a data-go="secSensors"><svg width="26" height="26" viewBox="0 0 24 24" fill="#dbe5fb"><path d="M4 20V10h4v10zm6 0V4h4v16zm6 0v-7h4v7z"/></svg><span>Sensors</span></a>
+ <a data-go="secCheck"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#dbe5fb" stroke-width="2.4" stroke-linecap="round"><circle cx="10.500" cy="10.500" r="6.500"/><path d="m16 16 5 5"/></svg><span>Obstacle Check</span></a>
  <a data-go="secTrain"><svg width="26" height="26" viewBox="0 0 24 24" fill="#dbe5fb"><path d="M6 2h12a3 3 0 0 1 3 3v10a3 3 0 0 1-3 3l2 3h-2.5l-1.5-2h-8L6.500 21H4l2-3a3 3 0 0 1-3-3V5a3 3 0 0 1 3-3zm0 3v5h12V5zm2.500 8.500a1.500 1.500 0 1 0 0 3 1.500 1.500 0 0 0 0-3zm7 0a1.500 1.500 0 1 0 0 3 1.500 1.500 0 0 0 0-3z"/></svg><span>Train Control</span></a>
  <a data-go="secEditor" data-tab="editor"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#dbe5fb" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m8 7-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg><span>Code Editor</span></a>
  <a data-go="secEditor" data-tab="terminal"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#dbe5fb" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m4 6 7 6-7 6M13 19h8"/></svg><span>Terminal</span></a>
@@ -862,12 +1061,12 @@ input[type=range]{width:100%;height:8px;margin:18px 0 10px;accent-color:var(--bl
   <section class="card sensor lidar" id="secSensors" style="grid-area:lidar">
    <h2><svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="2" fill="currentColor"/><path d="M8.500 8.500a5 5 0 0 0 0 7M15.500 8.500a5 5 0 0 1 0 7M5.600 5.600a9 9 0 0 0 0 12.800M18.400 5.600a9 9 0 0 1 0 12.800"/></svg>TF-Luna LiDAR</h2>
    <span class="badge off" id="lidarBadge"><i></i><b>No data</b></span>
-   <div class="val"><span id="lidarVal">--</span><small>cm</small></div>
+   <div class="val"><span id="lidarVal">--</span><small>cm</small></div><div class="snote" id="lidarNote"></div>
   </section>
   <section class="card sensor ultra" style="grid-area:ultra">
    <h2><svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="2" fill="currentColor"/><path d="M8.500 8.500a5 5 0 0 0 0 7M15.500 8.500a5 5 0 0 1 0 7M5.600 5.600a9 9 0 0 0 0 12.800M18.400 5.600a9 9 0 0 1 0 12.800"/></svg>HC-SR04 Ultrasonic</h2>
    <span class="badge off" id="ultraBadge"><i></i><b>No data</b></span>
-   <div class="val"><span id="ultraVal">--</span><small>cm</small></div>
+   <div class="val"><span id="ultraVal">--</span><small>cm</small></div><div class="snote" id="ultraNote"></div>
   </section>
 
   <section class="card alert clear" id="alert">
@@ -881,6 +1080,18 @@ input[type=range]{width:100%;height:8px;margin:18px 0 10px;accent-color:var(--bl
    <div class="anote" id="aNote"></div>
   </section>
  </div>
+
+ <section class="card" id="secCheck">
+  <h2><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#cfe0ff" stroke-width="2.400" stroke-linecap="round"><circle cx="10.500" cy="10.500" r="6.500"/><path d="m16 16 5 5"/></svg>Obstacle Check</h2>
+  <div class="chk">
+   <div class="chkL"><button class="btn blue big" id="chkBtn">Run Obstacle Check</button>
+    <button class="btn" id="baseBtn">Save clear-track reference</button>
+    <div class="hint" style="font-size:14px">Reads LiDAR and ultrasonic for about 1 second, then checks the camera. For the camera check, save a reference photo while the track is clear.</div></div>
+   <div class="chkR" id="chkR"><div class="chkV" id="chkV">Press &ldquo;Run Obstacle Check&rdquo; to test the track now.</div><div class="chkG" id="chkG"></div></div>
+   <div class="thumb" id="chkT" style="width:230px;height:160px;display:none"><img id="chkImg" alt=""></div>
+   <div style="min-width:230px;flex:1"><div class="hint" style="font-size:14px;margin-bottom:4px">Recent checks</div><div id="chkH" class="chkH"></div></div>
+  </div>
+ </section>
 
  <div class="bot">
   <section class="card" id="secTrain">
@@ -931,7 +1142,7 @@ function toast(t){const e=$('#toast');e.textContent=t;e.classList.add('on');clea
 
 /* ---------- realtime stream ---------- */
 let lastT=null, snapId=-1, sliderBusy=false, firstSync=true;
-function setSensor(id,d){const b=$('#'+id+'Badge');$('#'+id+'Val').textContent=d.ok?d.cm.toFixed(1):'--';b.className='badge'+(d.ok?'':' off');b.querySelector('b').textContent=d.ok?(d.sim?'Sim':'Live'):'No data'}
+function setSensor(id,d){$('#'+id+'Note').textContent=d.note||'';const b=$('#'+id+'Badge');$('#'+id+'Val').textContent=d.ok?d.cm.toFixed(1):'--';b.className='badge'+(d.ok?'':' off');b.querySelector('b').textContent=d.ok?(d.sim?'Sim':'Live'):'No data'}
 function render(d){
   lastT=d.train;
   $('#piName').textContent=d.sim?'Simulation mode':'Raspberry Pi 4';
@@ -1083,7 +1294,22 @@ $('#btnShut').onclick=()=>$('#modal').classList.add('on');
 $('#mNo').onclick=()=>$('#modal').classList.remove('on');
 $('#mYes').onclick=async()=>{const r=await J('/api/shutdown');$('#modal').classList.remove('on');toast(r.ok?'Shutting down... safe to unplug in ~20 s':(r.error||'Shutdown failed'))};
 
-loadDatasets();loadTree();setInterval(loadTree,6000);
+/* ---------- obstacle check ---------- */
+function showCheck(r){
+  $('#chkR').className='chkR '+r.level;$('#chkV').textContent=r.verdict;
+  const f=v=>v==null?'--':v.toFixed(1)+' cm';
+  $('#chkG').innerHTML=`<div>LiDAR<b>${f(r.lidar)}</b></div><div>Ultrasonic<b>${f(r.ultra)}</b></div><div>Nearest<b>${f(r.nearest)}</b></div><div>Camera<b style="font-size:20px">${esc(r.camera)}${r.label?' ('+esc(r.label)+')':''}</b></div>`;
+  if(r.snap_id){$('#chkT').style.display='block';$('#chkImg').src='/check.jpg?'+r.snap_id}
+}
+async function loadChkHist(){try{const h=await (await fetch('/api/check')).json();$('#chkH').innerHTML=h.slice().reverse().map(x=>`<div>${esc(x.time)} \u2014 ${esc(x.verdict)}</div>`).join('')}catch(e){}}
+$('#chkBtn').onclick=async()=>{
+  const b=$('#chkBtn');b.disabled=true;b.textContent='Checking...';$('#chkV').textContent='Reading sensors and camera...';
+  try{showCheck(await J('/api/check'));loadChkHist()}catch(e){toast('Check failed')}
+  b.disabled=false;b.textContent='Run Obstacle Check';
+};
+$('#baseBtn').onclick=async()=>{const r=await J('/api/baseline');toast(r.ok?'Clear-track reference saved':(r.error||'Failed'))};
+
+loadDatasets();loadTree();loadChkHist();setInterval(loadTree,6000);
 </script></body></html>
 """
 
